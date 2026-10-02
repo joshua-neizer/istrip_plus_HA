@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
@@ -25,18 +26,26 @@ from homeassistant.components.light import (
     LightEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.debounce import Debouncer
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 
 from .ble_helpers import find_notify_char
 from .const import (
+    CONF_KEEP_ALIVE,
+    CONF_KEEP_ALIVE_INTERVAL,
+    DEFAULT_KEEP_ALIVE,
+    DEFAULT_KEEP_ALIVE_INTERVAL,
     DEFAULT_SPEED,
     DOMAIN,
     EFFECT_DEFAULT_SPEEDS,
+    KEEP_ALIVE_RECONNECT_DELAY,
     KNOWN_CHAR_UUIDS,
+    MAX_KEEP_ALIVE_INTERVAL,
+    MIN_KEEP_ALIVE_INTERVAL,
     SPEED_SEND_INTERVAL,
 )
 from .payload_generator import CommandType, PayloadGenerator
@@ -73,7 +82,28 @@ async def async_setup_entry(
     address: str = entry.data["address"]
     char_uuid: str | None = entry.data.get("char_uuid")
     name: str = entry.data.get("name", "iStrip")
-    async_add_entities([IstripLight(address, char_uuid, name, entry.entry_id)])
+    keep_alive: bool = entry.options.get(CONF_KEEP_ALIVE, DEFAULT_KEEP_ALIVE)
+    keep_alive_interval = max(
+        MIN_KEEP_ALIVE_INTERVAL,
+        min(
+            MAX_KEEP_ALIVE_INTERVAL,
+            int(
+                entry.options.get(CONF_KEEP_ALIVE_INTERVAL, DEFAULT_KEEP_ALIVE_INTERVAL)
+            ),
+        ),
+    )
+    async_add_entities(
+        [
+            IstripLight(
+                address,
+                char_uuid,
+                name,
+                entry.entry_id,
+                keep_alive=keep_alive,
+                keep_alive_interval=keep_alive_interval,
+            )
+        ]
+    )
 
 
 class IstripLight(LightEntity, RestoreEntity):
@@ -92,6 +122,9 @@ class IstripLight(LightEntity, RestoreEntity):
         char_uuid: str | None,
         name: str,
         entry_id: str,
+        *,
+        keep_alive: bool = DEFAULT_KEEP_ALIVE,
+        keep_alive_interval: int = DEFAULT_KEEP_ALIVE_INTERVAL,
     ) -> None:
         """Initialize the iStrip light."""
         self._address = address
@@ -110,6 +143,15 @@ class IstripLight(LightEntity, RestoreEntity):
         # Serializes connect/subscribe/join so a concurrent call can't race
         # ahead and send a command before the join handshake has completed.
         self._connect_lock = asyncio.Lock()
+
+        # Keep-alive (see const.py). When disabled, none of this is used and
+        # the connection behaves exactly as before: it is only re-established
+        # lazily, the next time a command is sent.
+        self._keep_alive = keep_alive
+        self._keep_alive_interval = keep_alive_interval
+        self._keep_alive_running = False
+        self._reconnect_unsub: CALLBACK_TYPE | None = None
+        self._removing = False
 
         mac = address.lower().replace(":", "")
         self._attr_unique_id = f"istrip_{mac}"
@@ -288,6 +330,22 @@ class IstripLight(LightEntity, RestoreEntity):
             )
         )
 
+        if self._keep_alive:
+            _LOGGER.debug(
+                "Keep-alive enabled for %s, pinging every %ss",
+                self._address,
+                self._keep_alive_interval,
+            )
+            self.async_on_remove(
+                async_track_time_interval(
+                    self.hass,
+                    self._async_keep_alive_tick,
+                    timedelta(seconds=self._keep_alive_interval),
+                    name=f"iStrip keep-alive {self._address}",
+                    cancel_on_shutdown=True,
+                )
+            )
+
         await self._ensure_connected()
 
     @callback
@@ -309,6 +367,9 @@ class IstripLight(LightEntity, RestoreEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity is removed from Home Assistant."""
         await super().async_will_remove_from_hass()
+        # Stop the keep-alive from reconnecting while we tear down.
+        self._removing = True
+        self._cancel_scheduled_reconnect()
         if self._speed_debouncer is not None:
             self._speed_debouncer.async_shutdown()
         await self._disconnect()
@@ -342,6 +403,7 @@ class IstripLight(LightEntity, RestoreEntity):
                     BleakClientWithServiceCache,
                     ble_device,
                     self._attr_device_info["name"],
+                    disconnected_callback=self._on_disconnected,
                     max_attempts=3,
                 )
                 _LOGGER.debug("Connected to iStrip device at %s", self._address)
@@ -455,16 +517,109 @@ class IstripLight(LightEntity, RestoreEntity):
 
     async def _disconnect(self) -> None:
         """Disconnect from the BLE device."""
-        if self._client:
+        client = self._client
+        if client:
+            # Detach before disconnecting so _on_disconnected recognises this
+            # as an intentional disconnect and does not schedule a reconnect.
+            self._client = None
+            self._connected = False
             try:
-                if self._client.is_connected:
-                    await self._client.disconnect()
+                if client.is_connected:
+                    await client.disconnect()
                 _LOGGER.debug("Disconnected from iStrip device at %s", self._address)
             except Exception:  # noqa: BLE001 - disconnect can fail in many ways
                 _LOGGER.error("Error disconnecting from %s", self._address)
-            finally:
-                self._client = None
-                self._connected = False
+
+    @callback
+    def _on_disconnected(self, client: BleakClientWithServiceCache) -> None:
+        """Handle the BLE link dropping without us asking it to."""
+        if client is not self._client or self._removing:
+            # A client we already replaced or deliberately disconnected.
+            return
+
+        if not self._keep_alive:
+            # Keep the original lazy behaviour: _ensure_connected notices the
+            # dead client on the next command and reconnects then.
+            _LOGGER.debug("iStrip device at %s disconnected", self._address)
+            return
+
+        _LOGGER.debug(
+            "iStrip device at %s disconnected unexpectedly; reconnecting in %.0fs",
+            self._address,
+            KEEP_ALIVE_RECONNECT_DELAY,
+        )
+        self._connected = False
+        self._schedule_reconnect()
+
+    @callback
+    def _schedule_reconnect(self) -> None:
+        """Reconnect shortly, unless a reconnect is already pending."""
+        if self._removing or self._reconnect_unsub is not None:
+            return
+        self._reconnect_unsub = async_call_later(
+            self.hass, KEEP_ALIVE_RECONNECT_DELAY, self._async_scheduled_reconnect
+        )
+
+    @callback
+    def _cancel_scheduled_reconnect(self) -> None:
+        """Cancel a pending reconnect, if any."""
+        if self._reconnect_unsub is not None:
+            self._reconnect_unsub()
+            self._reconnect_unsub = None
+
+    async def _async_scheduled_reconnect(self, _now: datetime) -> None:
+        """Run a reconnect scheduled by _schedule_reconnect."""
+        self._reconnect_unsub = None
+        await self._async_keep_alive()
+
+    async def _async_keep_alive_tick(self, _now: datetime) -> None:
+        """Run the periodic keep-alive."""
+        await self._async_keep_alive()
+
+    async def _async_keep_alive(self) -> None:
+        """Ping the device if connected, or reconnect if not.
+
+        The ping is the join-group handshake. The device already expects it
+        on every connection, echoes it back without changing its output, and
+        _handle_notification ignores that echo, so it is safe to repeat. It
+        produces real traffic in both directions, which is what stops either
+        the lamp or a Bluetooth proxy treating the link as idle.
+        """
+        if self._removing or self._keep_alive_running:
+            return
+        if self._connect_lock.locked():
+            # A connect is already in progress (e.g. for a user command).
+            return
+
+        self._keep_alive_running = True
+        was_available = self._attr_available
+        try:
+            client = self._client
+            if not self._connected or client is None or not client.is_connected:
+                _LOGGER.debug("Keep-alive reconnecting to %s", self._address)
+                await self._ensure_connected()
+            else:
+                try:
+                    await client.write_gatt_char(
+                        self._char_uuid,
+                        bytes.fromhex(self._pg.get_join_group_payload()),
+                        response=False,
+                    )
+                    _LOGGER.debug("Keep-alive ping sent to %s", self._address)
+                # Same broad BLE failure surface as _send_payload.
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "Keep-alive ping to %s failed (%s); reconnecting",
+                        self._address,
+                        err,
+                    )
+                    self._connected = False
+                    await self._ensure_connected()
+        finally:
+            self._keep_alive_running = False
+
+        if self._attr_available != was_available and self.hass is not None:
+            self.async_write_ha_state()
 
     def _handle_notification(self, sender: int, data: bytearray) -> None:
         """Handle BLE notification from device."""

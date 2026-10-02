@@ -49,3 +49,21 @@ EFFECT_DEFAULT_SPEEDS: dict[str, int] = {
     "7-Color Flash": 100,
     "3-Color Flash": 100,
 }
+
+# Keep-alive (options flow). Some lamps, and some ESP32 Bluetooth proxies,
+# drop an idle BLE link after a while, so the next command first has to pay
+# for a full reconnect plus join handshake. When enabled, the integration
+# periodically re-sends the join handshake -- which the device already
+# expects on every connection and simply echoes back -- so neither end sees
+# the link as idle, and it reconnects straight away if the link drops anyway.
+CONF_KEEP_ALIVE = "keep_alive"
+CONF_KEEP_ALIVE_INTERVAL = "keep_alive_interval"
+
+DEFAULT_KEEP_ALIVE = False
+DEFAULT_KEEP_ALIVE_INTERVAL = 30
+MIN_KEEP_ALIVE_INTERVAL = 5
+MAX_KEEP_ALIVE_INTERVAL = 3600
+
+# Delay before reconnecting after an unexpected disconnect while keep-alive is
+# enabled. Gives a rebooting ESP32 proxy a moment to come back first.
+KEEP_ALIVE_RECONNECT_DELAY = 2.0
