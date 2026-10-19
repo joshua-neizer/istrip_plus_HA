@@ -64,11 +64,9 @@ MAX_KEEP_ALIVE_INTERVAL = 3600
 # back to back can knock an ESP32 proxy off the network for hours.
 RECONNECT_BACKOFF: tuple[float, ...] = (2.0, 30.0, 60.0, 120.0, 300.0)
 
-# No advertisement for this many seconds (time spent connected counts as
-# seen) means the lamp was off or out of range, so the next one counts as it
-# reappearing and may end a backoff early. A reappearing lamp is still never
-# retried within this many seconds of the last failed attempt.
-ADVERTISEMENT_GAP = 30.0
+# An advertisement from the lamp can end a backoff early, but not within this
+# many seconds of the last failed attempt.
+ADVERTISEMENT_RETRY_GAP = 30.0
 
 # Connection attempts per reconnect. Background reconnects rely on the backoff
 # instead of retrying, so each one holds the proxy's radio only briefly.

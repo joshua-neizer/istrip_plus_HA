@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -40,7 +39,7 @@ from homeassistant.util import dt as dt_util
 
 from .ble_helpers import find_notify_char
 from .const import (
-    ADVERTISEMENT_GAP,
+    ADVERTISEMENT_RETRY_GAP,
     BACKGROUND_CONNECT_ATTEMPTS,
     CONF_KEEP_ALIVE,
     CONF_KEEP_ALIVE_INTERVAL,
@@ -182,11 +181,6 @@ class IstripLight(LightEntity, RestoreEntity):
         self._backoff_timer: CALLBACK_TYPE | None = None
         self._connect_failures = 0
         self._last_failure: datetime | None = None
-        # Monotonic time the lamp was last seen (advertising, or connected:
-        # a connected peripheral stops advertising), and whether it has
-        # reappeared after a silence without an attempt having been made yet.
-        self._last_advertisement: float | None = None
-        self._reappeared = False
 
         mac = address.lower().replace(":", "")
         self._attr_unique_id = f"istrip_{mac}"
@@ -400,30 +394,16 @@ class IstripLight(LightEntity, RestoreEntity):
         service_info: BluetoothServiceInfoBleak,
         change: BluetoothChange,
     ) -> None:
-        """Connect when the lamp reappears, or when nothing else will.
+        """Connect when a scanner reports the device.
 
-        Home Assistant calls this for every advertisement it accepts, and an
-        ESPHome proxy relays them continuously, so a mere advertisement says
-        nothing new. Only a lamp that reappears after ADVERTISEMENT_GAP seconds
-        of silence (powered back on, back in range) may end a backoff early;
-        one that never stopped advertising waits the backoff out, which keeps
-        the slower tiers and the short grace after a drop meaningful.
+        Home Assistant skips advertisements identical to the last one, so this
+        only runs when the lamp appears, reappears or changes its advertisement.
+        That is a good moment to end a backoff early, as long as the last
+        attempt did not fail moments ago.
         """
-        previous = self._last_advertisement
-        self._last_advertisement = service_info.time
-        if previous is None or service_info.time - previous > ADVERTISEMENT_GAP:
-            # Kept until an attempt actually starts (see
-            # _async_background_connect), so a reappearance that lands while
-            # another attempt is running or within the retry gap of a failure
-            # still ends the next backoff early.
-            self._reappeared = True
-
         if self._connected or self._failed_recently():
             return
-        if self._backoff_timer is not None:
-            if not self._reappeared:
-                return
-            self._cancel_backoff()
+        self._cancel_backoff()
         self._start_background_connect()
 
     @callback
@@ -432,7 +412,7 @@ class IstripLight(LightEntity, RestoreEntity):
         if self._last_failure is None:
             return False
         elapsed = dt_util.utcnow() - self._last_failure
-        return elapsed < timedelta(seconds=ADVERTISEMENT_GAP)
+        return elapsed < timedelta(seconds=ADVERTISEMENT_RETRY_GAP)
 
     @callback
     def _start_background_connect(self) -> None:
@@ -566,10 +546,6 @@ class IstripLight(LightEntity, RestoreEntity):
                 self._connected = True
                 self._connect_failures = 0
                 self._last_failure = None
-                self._reappeared = False
-                # Connected counts as seen. service_info.time uses the same
-                # monotonic clock.
-                self._last_advertisement = time.monotonic()
                 self._cancel_backoff()
                 self._set_available(True)
 
@@ -675,10 +651,6 @@ class IstripLight(LightEntity, RestoreEntity):
         if client is not self._client or self._removing:
             return  # replaced, or disconnected on purpose
         _LOGGER.debug("iStrip device at %s disconnected", self._address)
-        # The lamp was not advertising while connected; count that time as
-        # seen, so the first advertisement after the drop is not mistaken for
-        # a reappearance that ends the post-drop backoff early.
-        self._last_advertisement = time.monotonic()
         # Without keep-alive, reconnect lazily on the next command.
         if self._keep_alive:
             self._connected = False
@@ -702,14 +674,15 @@ class IstripLight(LightEntity, RestoreEntity):
 
     @callback
     def _async_backoff_done(self, _now: datetime) -> None:
-        """End the backoff; with keep-alive on, try again straight away.
+        """End the backoff and try again, whether or not keep-alive is on.
 
-        The attempt runs as the tracked connect task, so removing the entity
-        can cancel it.
+        Without this retry, a lamp left unavailable after a failure would stay
+        that way: identical advertisements are not reported, and Home Assistant
+        drops commands sent to an unavailable entity. The attempt runs as the
+        tracked connect task, so removing the entity can cancel it.
         """
         self._backoff_timer = None
-        if self._keep_alive:
-            self._start_background_connect()
+        self._start_background_connect()
 
     async def _async_background_connect(self) -> None:
         """Make one connection attempt, unless connected, connecting or backing off."""
@@ -720,8 +693,6 @@ class IstripLight(LightEntity, RestoreEntity):
             or self._backoff_timer is not None
         ):
             return
-        # An attempt is starting, so any pending reappearance is now acted on.
-        self._reappeared = False
         _LOGGER.debug("Reconnecting to %s in the background", self._address)
         await self._ensure_connected(max_attempts=BACKGROUND_CONNECT_ATTEMPTS)
 
