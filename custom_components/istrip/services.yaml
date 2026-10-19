@@ -1,15 +1,16 @@
 set_speed:
   name: Set Speed
-  description: Set the animation speed of an iStrip+ light (0-100).
+  description: >-
+    Set the animation speed of the active effect on an iStrip+ light (0-100;
+    0 is sent as 1). With no effect active, the speed is held and applied to
+    the next effect selected.
+  target:
+    entity:
+      integration: istrip
+      domain: light
   fields:
-    entity_id:
-      description: Target light entity_id
-      example: light.istrip_aabbccddeeff
-      required: true
-      selector:
-        entity:
-          domain: light
     speed:
+      name: Speed
       description: Speed value (0..100)
       required: true
       selector:
@@ -21,15 +22,16 @@ set_speed:
 set_effect:
   name: Set Effect
   description: Set an effect on an iStrip+ light.
+  target:
+    entity:
+      integration: istrip
+      domain: light
   fields:
-    entity_id:
-      description: Target light entity_id
-      required: true
-      selector:
-        entity:
-          domain: light
     effect:
-      description: Effect name (Static, Fade7, Strobe, Flash)
+      name: Effect
+      description: >-
+        Effect name, one of the light's effects (for example 7-Color Fade or
+        Red Strobe).
       required: true
       selector:
         select:
@@ -48,6 +50,7 @@ set_effect:
             - Green Strobe
 
     speed:
+      name: Speed
       description: Optional speed (0..100) to apply with the effect
       required: false
       selector:

@@ -165,7 +165,7 @@ service: istrip.set_effect
 data:
   entity_id: light.istrip_ble_light
   effect: 7-Color Fade
-  speed: 75 # Optional: 1-100
+  speed: 75 # Optional: 0-100 (0 is sent as 1)
 ```
 
 **Change speed of current effect:**
@@ -224,7 +224,7 @@ To keep the connection open, go to **Settings → Devices & Services → iStrip+
 
 | Option | Default | Description |
 | --- | --- | --- |
-| **Keep connection alive** | Off | Periodically pings the lamp so neither end treats the link as idle, and reconnects straight away if it drops. If the lamp stays unreachable, it retries less and less often, down to once every 5 minutes, so a struggling Bluetooth proxy is not flooded with connection attempts. |
+| **Keep connection alive** | Off | Periodically pings the lamp so neither end treats the link as idle, and reconnects straight away if it drops. If the lamp stays unreachable, it retries less and less often, down to once every 5 minutes, so a struggling Bluetooth proxy is not flooded with connection attempts. If the lamp disappears and later shows up again (switched back on, or back in range), it retries within about 30 s instead of waiting out the backoff. |
 | **Ping interval** | 30 s | Seconds between pings (5–3600). Lower is more reliable; higher sends less Bluetooth traffic. |
 
 Saving the options reloads the integration; no restart is needed.
