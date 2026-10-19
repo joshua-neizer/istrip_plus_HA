@@ -1,5 +1,8 @@
 # iStrip BLE Light Integration for Home Assistant
 
+> [!NOTE]
+> **This is a fork** of [vakintosh/istrip_plus_HA](https://github.com/vakintosh/istrip_plus_HA), tuned for lamps reached through an **ESP32 Bluetooth proxy** (such as an ESPHome Bluetooth Proxy). Some ESP32 proxies and lamps drop an idle BLE connection, which makes the light slow to respond and misses changes made with the IR remote. This fork adds an optional keep-alive that holds the connection open and reconnects with a backoff, so a struggling proxy is not flooded with connection attempts. See [Keep-alive](#keep-alive-connection-settings) to turn it on.
+
 This custom integration replicates core features of the official iStrip+ app, enabling control of iStrip BLE (Bluetooth Low Energy) LED lights directly from Home Assistant. It communicates over BLE using AES-encrypted commands to provide smooth RGB color and brightness adjustments, just like the original app.
 
 ---
