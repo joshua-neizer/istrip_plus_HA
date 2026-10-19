@@ -43,13 +43,19 @@ jobs:
 
       - name: Detect bump type from PR title
         id: bump
+        # Passed through the environment, never expanded into the script: a
+        # PR title is attacker-controlled and this job holds a write token.
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
         run: |
-          TITLE="${{ github.event.pull_request.title }}"
-          if echo "$TITLE" | grep -qi "BREAKING CHANGE"; then
+          # A "!" before the colon marks a breaking change, for fix as well
+          # as feat.
+          if echo "$TITLE" | grep -qi "BREAKING CHANGE" ||
+            echo "$TITLE" | grep -qE '^(feat|fix)(\([^)]*\))?!:'; then
             BUMP="major"
-          elif echo "$TITLE" | grep -qE '^feat(\(|!|\:)'; then
+          elif echo "$TITLE" | grep -qE '^feat(\([^)]*\))?:'; then
             BUMP="minor"
-          elif echo "$TITLE" | grep -qE '^fix(\(|\:)'; then
+          elif echo "$TITLE" | grep -qE '^fix(\([^)]*\))?:'; then
             BUMP="patch"
           else
             # docs/ci/chore/test/refactor/style and anything else ships no
@@ -101,10 +107,21 @@ jobs:
       - name: Generate CHANGELOG
         if: steps.bump.outputs.type != 'none'
         run: |
+          # The tag does not exist yet and the repo has no package.json, so
+          # hand the tool the new version explicitly; otherwise every heading
+          # comes out with an empty version and a compare link ending in "v".
+          # name is required by the tool's package normalisation; repository
+          # keeps the compare links pointing at this repo.
+          REPO_URL="https://github.com/vakintosh/istrip_plus_HA"
+          printf '{"name": "istrip", "version": "%s", "repository": {"type": "git", "url": "%s"}}\n' \
+            "${{ steps.bump_version.outputs.new }}" "$REPO_URL" \
+            > "$RUNNER_TEMP/package.json"
           touch CHANGELOG.md
-          conventional-changelog -p angular -i CHANGELOG.md -s
+          conventional-changelog -p angular -i CHANGELOG.md -s \
+            --pkg "$RUNNER_TEMP/package.json" -t v
           # Release body should describe this release only, not the whole file.
-          conventional-changelog -p angular -r 1 > RELEASE_NOTES.md
+          conventional-changelog -p angular -r 1 \
+            --pkg "$RUNNER_TEMP/package.json" -t v > RELEASE_NOTES.md
 
       - name: Commit and tag
         if: steps.bump.outputs.type != 'none'

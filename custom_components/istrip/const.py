@@ -49,3 +49,26 @@ EFFECT_DEFAULT_SPEEDS: dict[str, int] = {
     "7-Color Flash": 100,
     "3-Color Flash": 100,
 }
+
+# Keep-alive options. Some lamps and ESP32 proxies drop an idle BLE link, so
+# the next command has to reconnect first.
+CONF_KEEP_ALIVE = "keep_alive"
+CONF_KEEP_ALIVE_INTERVAL = "keep_alive_interval"
+
+DEFAULT_KEEP_ALIVE = False
+DEFAULT_KEEP_ALIVE_INTERVAL = 30
+MIN_KEEP_ALIVE_INTERVAL = 5
+MAX_KEEP_ALIVE_INTERVAL = 3600
+
+# Seconds before each background reconnect; the last entry repeats. Retrying
+# back to back can knock an ESP32 proxy off the network for hours.
+RECONNECT_BACKOFF: tuple[float, ...] = (2.0, 30.0, 60.0, 120.0, 300.0)
+
+# An advertisement from the lamp can end a backoff early, but not within this
+# many seconds of the last failed attempt.
+ADVERTISEMENT_RETRY_GAP = 30.0
+
+# Connection attempts per reconnect. Background reconnects rely on the backoff
+# instead of retrying, so each one holds the proxy's radio only briefly.
+BACKGROUND_CONNECT_ATTEMPTS = 1
+USER_CONNECT_ATTEMPTS = 3

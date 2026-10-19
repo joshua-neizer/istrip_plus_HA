@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
+import voluptuous as vol
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 from homeassistant.components.bluetooth import (
     BluetoothCallbackMatcher,
@@ -25,23 +28,48 @@ from homeassistant.components.light import (
     LightEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers import entity_platform
+from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.debounce import Debouncer
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
+from homeassistant.util import dt as dt_util
 
 from .ble_helpers import find_notify_char
 from .const import (
+    ADVERTISEMENT_RETRY_GAP,
+    BACKGROUND_CONNECT_ATTEMPTS,
+    CONF_KEEP_ALIVE,
+    CONF_KEEP_ALIVE_INTERVAL,
+    DEFAULT_KEEP_ALIVE,
+    DEFAULT_KEEP_ALIVE_INTERVAL,
     DEFAULT_SPEED,
     DOMAIN,
     EFFECT_DEFAULT_SPEEDS,
     KNOWN_CHAR_UUIDS,
+    MAX_KEEP_ALIVE_INTERVAL,
+    MIN_KEEP_ALIVE_INTERVAL,
+    RECONNECT_BACKOFF,
     SPEED_SEND_INTERVAL,
+    USER_CONNECT_ATTEMPTS,
 )
 from .payload_generator import CommandType, PayloadGenerator
 
 _LOGGER = logging.getLogger(__name__)
+
+SERVICE_SET_EFFECT = "set_effect"
+SERVICE_SET_SPEED = "set_speed"
+
+# 0 is accepted and sent as 1, as the official app does (see _clamp_speed).
+SPEED_SCHEMA = vol.All(vol.Coerce(int), vol.Range(min=0, max=100))
+
+SET_EFFECT_SCHEMA = {
+    vol.Required("effect"): vol.In(list(PayloadGenerator.EFFECT_MODES)),
+    vol.Optional("speed"): SPEED_SCHEMA,
+}
+SET_SPEED_SCHEMA = {vol.Required("speed"): SPEED_SCHEMA}
 
 
 def _clamp_speed(speed: int) -> int:
@@ -73,7 +101,38 @@ async def async_setup_entry(
     address: str = entry.data["address"]
     char_uuid: str | None = entry.data.get("char_uuid")
     name: str = entry.data.get("name", "iStrip")
-    async_add_entities([IstripLight(address, char_uuid, name, entry.entry_id)])
+    # The options flow validates UI input, but options written any other way
+    # (a script, a hand-edited .storage file) are not; an interval of 0 would
+    # fire the keep-alive tick continuously.
+    interval = int(
+        entry.options.get(CONF_KEEP_ALIVE_INTERVAL, DEFAULT_KEEP_ALIVE_INTERVAL)
+    )
+    keep_alive_interval = max(
+        MIN_KEEP_ALIVE_INTERVAL, min(MAX_KEEP_ALIVE_INTERVAL, interval)
+    )
+    async_add_entities(
+        [
+            IstripLight(
+                address,
+                char_uuid,
+                name,
+                entry.entry_id,
+                keep_alive=entry.options.get(CONF_KEEP_ALIVE, DEFAULT_KEEP_ALIVE),
+                keep_alive_interval=keep_alive_interval,
+            )
+        ]
+    )
+
+    # Entity services are registered once for the domain (later calls are
+    # no-ops) and cover every iStrip light, so unloading one lamp's entry
+    # leaves them working for the others.
+    platform = entity_platform.async_get_current_platform()
+    platform.async_register_entity_service(
+        SERVICE_SET_EFFECT, SET_EFFECT_SCHEMA, "set_effect"
+    )
+    platform.async_register_entity_service(
+        SERVICE_SET_SPEED, SET_SPEED_SCHEMA, "set_speed"
+    )
 
 
 class IstripLight(LightEntity, RestoreEntity):
@@ -92,6 +151,9 @@ class IstripLight(LightEntity, RestoreEntity):
         char_uuid: str | None,
         name: str,
         entry_id: str,
+        *,
+        keep_alive: bool = DEFAULT_KEEP_ALIVE,
+        keep_alive_interval: int = DEFAULT_KEEP_ALIVE_INTERVAL,
     ) -> None:
         """Initialize the iStrip light."""
         self._address = address
@@ -110,6 +172,15 @@ class IstripLight(LightEntity, RestoreEntity):
         # Serializes connect/subscribe/join so a concurrent call can't race
         # ahead and send a command before the join handshake has completed.
         self._connect_lock = asyncio.Lock()
+
+        self._keep_alive = keep_alive
+        self._keep_alive_interval = keep_alive_interval
+        self._removing = False
+        self._connect_task: asyncio.Task[None] | None = None
+        # Background reconnects wait while the backoff timer is pending.
+        self._backoff_timer: CALLBACK_TYPE | None = None
+        self._connect_failures = 0
+        self._last_failure: datetime | None = None
 
         mac = address.lower().replace(":", "")
         self._attr_unique_id = f"istrip_{mac}"
@@ -149,7 +220,9 @@ class IstripLight(LightEntity, RestoreEntity):
 
         # Always convert to the device's 0-100 scale, even when brightness
         # wasn't explicitly passed (e.g. a color-only call while already on).
-        brightness = int(self._attr_brightness * 100 / 255)
+        # Floor at 1: HA brightness 1-2 would otherwise round to 0, which
+        # turns the strip off while the entity still reports it as on.
+        brightness = max(1, int(self._attr_brightness * 100 / 255))
 
         if self._attr_effect and ATTR_RGB_COLOR not in kwargs:
             payload = self._build_effect_payload(self._attr_effect)
@@ -165,17 +238,23 @@ class IstripLight(LightEntity, RestoreEntity):
         payload = self._pg.send_led_off()
         await self._send_payload(payload)
 
-    async def set_effect(self, effect_name: str, speed: int | None = None) -> None:
-        """Set an effect, optionally overriding that effect's speed."""
-        if speed is not None:
-            self._store_speed(effect_name, speed)
+    async def set_effect(self, effect: str, speed: int | None = None) -> None:
+        """Set an effect, optionally overriding that effect's speed.
 
-        self._adopt_pending_speed(effect_name)
-        self._attr_effect = effect_name
-        payload = self._build_effect_payload(effect_name)
+        Called by the istrip.set_effect entity service, which passes the
+        service fields as keyword arguments.
+        """
+        if speed is not None:
+            self._store_speed(effect, speed)
+
+        self._adopt_pending_speed(effect)
+        self._attr_effect = effect
+        payload = self._build_effect_payload(effect)
 
         if self._attr_is_on:
             await self._send_payload(payload)
+        # Entity services do not write state for non-polled entities.
+        self.async_write_ha_state()
 
     async def set_speed(self, speed: int) -> None:
         """Set the speed of the active effect.
@@ -192,12 +271,14 @@ class IstripLight(LightEntity, RestoreEntity):
                 "No effect active; holding speed %s for the next effect",
                 self._pending_speed,
             )
+            self.async_write_ha_state()
             return
 
         self._store_speed(self._attr_effect, speed)
 
         if self._attr_is_on and self._speed_debouncer is not None:
             await self._speed_debouncer.async_call()
+        self.async_write_ha_state()
 
     def _speed_for(self, effect_name: str | None) -> int:
         """Return the stored speed for an effect, or the device default."""
@@ -288,7 +369,24 @@ class IstripLight(LightEntity, RestoreEntity):
             )
         )
 
-        await self._ensure_connected()
+        if self._keep_alive:
+            _LOGGER.debug(
+                "Keep-alive enabled for %s, pinging every %ss",
+                self._address,
+                self._keep_alive_interval,
+            )
+            self.async_on_remove(
+                async_track_time_interval(
+                    self.hass,
+                    self._async_keep_alive_tick,
+                    timedelta(seconds=self._keep_alive_interval),
+                    name=f"iStrip keep-alive {self._address}",
+                    cancel_on_shutdown=True,
+                )
+            )
+
+        # Connect in the background so an unreachable lamp cannot hold up setup.
+        self._start_background_connect()
 
     @callback
     def _async_device_seen(
@@ -296,10 +394,34 @@ class IstripLight(LightEntity, RestoreEntity):
         service_info: BluetoothServiceInfoBleak,
         change: BluetoothChange,
     ) -> None:
-        """Connect once a scanner reports the device, if not already connected."""
-        if self._connected:
+        """Connect when a scanner reports the device.
+
+        Home Assistant skips advertisements identical to the last one, so this
+        only runs when the lamp appears, reappears or changes its advertisement.
+        That is a good moment to end a backoff early, as long as the last
+        attempt did not fail moments ago.
+        """
+        if self._connected or self._failed_recently():
             return
-        self.hass.async_create_task(self._ensure_connected())
+        self._cancel_backoff()
+        self._start_background_connect()
+
+    @callback
+    def _failed_recently(self) -> bool:
+        """Return whether a connection attempt failed within the retry gap."""
+        if self._last_failure is None:
+            return False
+        elapsed = dt_util.utcnow() - self._last_failure
+        return elapsed < timedelta(seconds=ADVERTISEMENT_RETRY_GAP)
+
+    @callback
+    def _start_background_connect(self) -> None:
+        """Run _async_background_connect as a tracked background task."""
+        if self._connect_task is not None and not self._connect_task.done():
+            return
+        self._connect_task = self.hass.async_create_background_task(
+            self._async_background_connect(), f"iStrip connect {self._address}"
+        )
 
     @property
     def extra_restore_state_data(self) -> IstripExtraStoredData:
@@ -308,12 +430,22 @@ class IstripLight(LightEntity, RestoreEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity is removed from Home Assistant."""
+        # Set first, so a keep-alive tick or backoff that fires during the
+        # super call sees it and does not start a new connection.
+        self._removing = True
         await super().async_will_remove_from_hass()
+        self._cancel_backoff()
+        if self._connect_task is not None and not self._connect_task.done():
+            self._connect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._connect_task
         if self._speed_debouncer is not None:
             self._speed_debouncer.async_shutdown()
         await self._disconnect()
 
-    async def _ensure_connected(self) -> None:
+    async def _ensure_connected(
+        self, max_attempts: int = USER_CONNECT_ATTEMPTS
+    ) -> None:
         """Ensure BLE connection is established and notifications are enabled."""
         async with self._connect_lock:
             if self._connected and self._client and self._client.is_connected:
@@ -330,20 +462,27 @@ class IstripLight(LightEntity, RestoreEntity):
                     # Normal at startup: the lamp simply has not advertised
                     # yet. _async_device_seen retries as soon as a scanner
                     # reports it, so this is not an error.
+                    # Costs no radio time, so it does not start a backoff.
                     _LOGGER.debug(
                         "No connectable Bluetooth scanner sees %s yet; will "
                         "connect when it is next seen",
                         self._address,
                     )
-                    self._attr_available = False
+                    self._set_available(False, "no Bluetooth scanner can see it")
                     return
 
                 self._client = await establish_connection(
                     BleakClientWithServiceCache,
                     ble_device,
                     self._attr_device_info["name"],
-                    max_attempts=3,
+                    disconnected_callback=self._on_disconnected,
+                    max_attempts=max_attempts,
                 )
+                if self._removing:
+                    # The entity was removed while connecting; do not keep a
+                    # link (and a proxy slot) that nothing will ever close.
+                    await self._disconnect()
+                    return
                 _LOGGER.debug("Connected to iStrip device at %s", self._address)
 
                 # If char_uuid was not discovered during setup, find it now
@@ -387,31 +526,70 @@ class IstripLight(LightEntity, RestoreEntity):
 
                 # The device requires a one-time "join group" handshake right
                 # after connecting, before it will act on any other command.
+                # Without it every later command is discarded, so a failed
+                # handshake is a failed connection.
                 try:
                     join_payload = self._pg.get_join_group_payload()
                     await self._client.write_gatt_char(
                         self._char_uuid, bytes.fromhex(join_payload), response=False
                     )
-                    _LOGGER.debug("Sent join-group handshake to %s", self._address)
                 # See the notify-subscribe except above: BLE errors here are
                 # similarly broad and unpredictable.
-                except Exception:  # noqa: BLE001
-                    _LOGGER.warning(
-                        "Failed to send join-group handshake to %s", self._address
-                    )
+                except Exception as err:  # noqa: BLE001
+                    raise ConnectionError(
+                        f"join-group handshake failed: {err}"
+                    ) from err
+                _LOGGER.debug("Sent join-group handshake to %s", self._address)
 
                 # Only mark connected once the join handshake has gone out,
                 # so a waiting caller never sends a command ahead of it.
                 self._connected = True
-                self._attr_available = True
+                self._connect_failures = 0
+                self._last_failure = None
+                self._cancel_backoff()
+                self._set_available(True)
 
             # Connection/discovery can fail in many BLE-stack-specific ways;
             # treat any of them as a failed connection attempt.
-            except Exception:  # noqa: BLE001
-                _LOGGER.error("Failed to connect to device at %s", self._address)
+            except Exception as err:  # noqa: BLE001
                 self._connected = False
-                self._client = None
-                self._attr_available = False
+                # A failed handshake gets here with a live link; close it.
+                await self._disconnect()
+                if not self._removing:
+                    self._record_connect_failure(err)
+
+    @callback
+    def _set_available(self, available: bool, reason: str = "") -> None:
+        """Update availability, logging and writing state only when it changes."""
+        if available == self._attr_available:
+            return
+        if available:
+            _LOGGER.info("iStrip device at %s is available again", self._address)
+        else:
+            _LOGGER.info(
+                "iStrip device at %s is unavailable: %s", self._address, reason
+            )
+        self._attr_available = available
+        self.async_write_ha_state()
+
+    @callback
+    def _record_connect_failure(self, err: Exception) -> None:
+        """Mark unavailable and hold off background reconnects for a while."""
+        reason = str(err) or type(err).__name__
+        self._set_available(False, reason)
+        self._connect_failures += 1
+        self._last_failure = dt_util.utcnow()
+        delay = RECONNECT_BACKOFF[
+            min(self._connect_failures, len(RECONNECT_BACKOFF) - 1)
+        ]
+        _LOGGER.debug(
+            "Connection attempt %d to %s failed (%s); next background attempt in %.0fs",
+            self._connect_failures,
+            self._address,
+            reason,
+            delay,
+        )
+        self._schedule_backoff(delay)
 
     def _persist_char_uuid(self) -> None:
         """Store a runtime-discovered characteristic back on the config entry.
@@ -455,16 +633,94 @@ class IstripLight(LightEntity, RestoreEntity):
 
     async def _disconnect(self) -> None:
         """Disconnect from the BLE device."""
-        if self._client:
+        client = self._client
+        if client:
+            # Detach first so _on_disconnected ignores this disconnect.
+            self._client = None
+            self._connected = False
             try:
-                if self._client.is_connected:
-                    await self._client.disconnect()
+                if client.is_connected:
+                    await client.disconnect()
                 _LOGGER.debug("Disconnected from iStrip device at %s", self._address)
             except Exception:  # noqa: BLE001 - disconnect can fail in many ways
                 _LOGGER.error("Error disconnecting from %s", self._address)
-            finally:
-                self._client = None
+
+    @callback
+    def _on_disconnected(self, client: BleakClientWithServiceCache) -> None:
+        """Handle the lamp dropping the connection on its own."""
+        if client is not self._client or self._removing:
+            return  # replaced, or disconnected on purpose
+        _LOGGER.debug("iStrip device at %s disconnected", self._address)
+        # Without keep-alive, reconnect lazily on the next command.
+        if self._keep_alive:
+            self._connected = False
+            self._schedule_backoff(RECONNECT_BACKOFF[0])
+
+    @callback
+    def _schedule_backoff(self, delay: float) -> None:
+        """Hold off background reconnects for `delay` seconds."""
+        if self._removing or self._backoff_timer is not None:
+            return
+        self._backoff_timer = async_call_later(
+            self.hass, delay, self._async_backoff_done
+        )
+
+    @callback
+    def _cancel_backoff(self) -> None:
+        """Cancel a pending backoff, if any."""
+        if self._backoff_timer is not None:
+            self._backoff_timer()
+            self._backoff_timer = None
+
+    @callback
+    def _async_backoff_done(self, _now: datetime) -> None:
+        """End the backoff and try again, whether or not keep-alive is on.
+
+        Without this retry, a lamp left unavailable after a failure would stay
+        that way: identical advertisements are not reported, and Home Assistant
+        drops commands sent to an unavailable entity. The attempt runs as the
+        tracked connect task, so removing the entity can cancel it.
+        """
+        self._backoff_timer = None
+        self._start_background_connect()
+
+    async def _async_background_connect(self) -> None:
+        """Make one connection attempt, unless connected, connecting or backing off."""
+        if (
+            self._connected
+            or self._removing
+            or self._connect_lock.locked()
+            or self._backoff_timer is not None
+        ):
+            return
+        _LOGGER.debug("Reconnecting to %s in the background", self._address)
+        await self._ensure_connected(max_attempts=BACKGROUND_CONNECT_ATTEMPTS)
+
+    async def _async_keep_alive_tick(self, _now: datetime) -> None:
+        """Ping the lamp if connected, or reconnect if not.
+
+        The ping is the join-group handshake: the device echoes it back without
+        changing its output, and _handle_notification ignores the echo.
+        """
+        client = self._client
+        if self._connected and client is not None and client.is_connected:
+            try:
+                await client.write_gatt_char(
+                    self._char_uuid,
+                    bytes.fromhex(self._pg.get_join_group_payload()),
+                    response=False,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Keep-alive ping to %s failed (%s); reconnecting",
+                    self._address,
+                    err,
+                )
                 self._connected = False
+            else:
+                _LOGGER.debug("Keep-alive ping sent to %s", self._address)
+                return
+        await self._async_background_connect()
 
     def _handle_notification(self, sender: int, data: bytearray) -> None:
         """Handle BLE notification from device."""

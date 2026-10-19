@@ -1,5 +1,8 @@
 # iStrip BLE Light Integration for Home Assistant
 
+> [!NOTE]
+> **This is a fork** of [vakintosh/istrip_plus_HA](https://github.com/vakintosh/istrip_plus_HA), tuned for lamps reached through an **ESP32 Bluetooth proxy** (such as an ESPHome Bluetooth Proxy). Some ESP32 proxies and lamps drop an idle BLE connection, which makes the light slow to respond and misses changes made with the IR remote. This fork adds an optional keep-alive that holds the connection open and reconnects with a backoff, so a struggling proxy is not flooded with connection attempts. See [Keep-alive](#keep-alive-connection-settings) to turn it on.
+
 This custom integration replicates core features of the official iStrip+ app, enabling control of iStrip BLE (Bluetooth Low Energy) LED lights directly from Home Assistant. It communicates over BLE using AES-encrypted commands to provide smooth RGB color and brightness adjustments, just like the original app.
 
 ---
@@ -11,6 +14,7 @@ This custom integration replicates core features of the official iStrip+ app, en
 - **12 built-in effects**: Fade, Breath, Strobe, Flash (in various colors)
 - Adjustable effect speed and brightness
 - **State synchronization**: Automatically updates Home Assistant when controlled via infrared remote
+- **Optional keep-alive**: Keeps the Bluetooth connection open so commands respond instantly
 - Communicates via AES-encrypted BLE packets
 - Supports automatic Bluetooth device discovery
 - Fully asynchronous and compatible with Home Assistant's light platform
@@ -164,7 +168,7 @@ service: istrip.set_effect
 data:
   entity_id: light.istrip_ble_light
   effect: 7-Color Fade
-  speed: 75 # Optional: 1-100
+  speed: 75 # Optional: 0-100 (0 is sent as 1)
 ```
 
 **Change speed of current effect:**
@@ -215,6 +219,25 @@ The integration maintains a persistent BLE connection to automatically sync stat
 
 ---
 
+## Keep-alive (connection settings)
+
+Some lamps, and some ESP32 Bluetooth proxies, drop a BLE connection that has been idle for a while. When that happens the next command has to reconnect first, so the light takes a second or so to respond, and IR-remote changes made while disconnected are not picked up.
+
+To keep the connection open, go to **Settings → Devices & Services → iStrip+ BLE Light → Configure** and set:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| **Keep connection alive** | Off | Periodically pings the lamp so neither end treats the link as idle, and reconnects straight away if it drops. If the lamp stays unreachable, it retries less and less often, down to once every 5 minutes, so a struggling Bluetooth proxy is not flooded with connection attempts. If the lamp disappears and later shows up again (switched back on, or back in range), it retries within about 30 s instead of waiting out the backoff. |
+| **Ping interval** | 30 s | Seconds between pings (5–3600). Lower is more reliable; higher sends less Bluetooth traffic. |
+
+Saving the options reloads the integration; no restart is needed.
+
+The ping is the same "join group" handshake the integration sends on every connection. The lamp echoes it back without changing what it is displaying.
+
+> **Note:** a permanently open connection occupies one of your Bluetooth adapter's or ESP32 proxy's connection slots (ESPHome proxies have 3 by default). If you run several always-connected BLE devices through one proxy, you may need to raise `bluetooth_proxy: connection_slots` or add another proxy.
+
+---
+
 ## Code Overview
 
 - `__init__.py` — Minimal setup functions for Home Assistant.
@@ -238,6 +261,7 @@ The integration maintains a persistent BLE connection to automatically sync stat
 - Ensure Bluetooth is enabled and your Home Assistant host supports BLE.
 - If devices do not appear during discovery, make sure the iStrip light is powered on and nearby.
 - Check Home Assistant logs for BLE communication errors if commands fail.
+- If the light is slow to respond after sitting idle, enable **Keep connection alive** (see [Keep-alive](#keep-alive-connection-settings)).
 
 ---
 

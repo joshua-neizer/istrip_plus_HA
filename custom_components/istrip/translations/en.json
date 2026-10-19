@@ -22,6 +22,22 @@
       "no_valid_char_found": "Could not find a writable characteristic on the device"
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Connection settings",
+        "description": "Some lamps and ESP32 Bluetooth proxies drop an idle connection, which makes the next command lag while the integration reconnects. Keep-alive pings the lamp periodically so the link stays up, and reconnects straight away if it drops. Note that a permanent connection occupies one of your Bluetooth proxy's connection slots.",
+        "data": {
+          "keep_alive": "Keep connection alive",
+          "keep_alive_interval": "Ping interval"
+        },
+        "data_description": {
+          "keep_alive": "Periodically ping the lamp so the Bluetooth connection is not dropped for being idle.",
+          "keep_alive_interval": "Seconds between pings. Lower values keep the link more reliably at the cost of a little more Bluetooth traffic."
+        }
+      }
+    }
+  },
   "entity": {
     "light": {
       "istrip_light": {

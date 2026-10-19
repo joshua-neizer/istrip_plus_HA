@@ -13,11 +13,32 @@ from homeassistant.components.bluetooth import (
     async_ble_device_from_address,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.const import CONF_ADDRESS, CONF_NAME
+from homeassistant.core import callback
+from homeassistant.helpers.selector import (
+    BooleanSelector,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 
 from .ble_helpers import find_notify_char
-from .const import DOMAIN, KNOWN_CHAR_UUIDS
+from .const import (
+    CONF_KEEP_ALIVE,
+    CONF_KEEP_ALIVE_INTERVAL,
+    DEFAULT_KEEP_ALIVE,
+    DEFAULT_KEEP_ALIVE_INTERVAL,
+    DOMAIN,
+    KNOWN_CHAR_UUIDS,
+    MAX_KEEP_ALIVE_INTERVAL,
+    MIN_KEEP_ALIVE_INTERVAL,
+)
 from .payload_generator import PayloadGenerator
 
 _LOGGER = logging.getLogger(__name__)
@@ -38,6 +59,12 @@ class IstripConfigFlow(ConfigFlow, domain=DOMAIN):
         self._discovered_devices: dict[str, BluetoothServiceInfoBleak] = {}
         self._discovery_info: BluetoothServiceInfoBleak | None = None
         self._char_uuid: str | None = None
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> IstripOptionsFlow:
+        """Return the options flow for this handler."""
+        return IstripOptionsFlow()
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
@@ -234,3 +261,46 @@ class IstripConfigFlow(ConfigFlow, domain=DOMAIN):
                     _LOGGER.debug("Could not unsubscribe from %s: %s", notify_uuid, err)
 
         return None
+
+
+class IstripOptionsFlow(OptionsFlowWithReload):
+    """Handle iStrip+ options."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the keep-alive options."""
+        if user_input is not None:
+            return self.async_create_entry(
+                data={
+                    CONF_KEEP_ALIVE: user_input[CONF_KEEP_ALIVE],
+                    CONF_KEEP_ALIVE_INTERVAL: int(user_input[CONF_KEEP_ALIVE_INTERVAL]),
+                }
+            )
+
+        options = self.config_entry.options
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_KEEP_ALIVE,
+                        default=options.get(CONF_KEEP_ALIVE, DEFAULT_KEEP_ALIVE),
+                    ): BooleanSelector(),
+                    vol.Required(
+                        CONF_KEEP_ALIVE_INTERVAL,
+                        default=options.get(
+                            CONF_KEEP_ALIVE_INTERVAL, DEFAULT_KEEP_ALIVE_INTERVAL
+                        ),
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=MIN_KEEP_ALIVE_INTERVAL,
+                            max=MAX_KEEP_ALIVE_INTERVAL,
+                            step=1,
+                            unit_of_measurement="s",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    ),
+                }
+            ),
+        )
