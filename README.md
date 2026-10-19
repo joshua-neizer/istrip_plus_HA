@@ -224,7 +224,7 @@ To keep the connection open, go to **Settings → Devices & Services → iStrip+
 
 | Option | Default | Description |
 | --- | --- | --- |
-| **Keep connection alive** | Off | Periodically pings the lamp so neither end treats the link as idle, and reconnects straight away if it drops. |
+| **Keep connection alive** | Off | Periodically pings the lamp so neither end treats the link as idle, and reconnects straight away if it drops. If the lamp stays unreachable, it retries less and less often, down to once every 5 minutes, so a struggling Bluetooth proxy is not flooded with connection attempts. |
 | **Ping interval** | 30 s | Seconds between pings (5–3600). Lower is more reliable; higher sends less Bluetooth traffic. |
 
 Saving the options reloads the integration; no restart is needed.

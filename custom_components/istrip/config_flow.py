@@ -264,11 +264,7 @@ class IstripConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class IstripOptionsFlow(OptionsFlowWithReload):
-    """Handle iStrip+ options.
-
-    Reloads the entry on save, so the light entity picks up the new keep-alive
-    settings without a Home Assistant restart.
-    """
+    """Handle iStrip+ options."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
